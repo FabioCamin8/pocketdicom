@@ -4,11 +4,21 @@ A small self-hosted imaging workspace for desktop and mobile browsers. The inter
 
 ## Screenshots
 
-The screenshots use generated DICOM fixtures with geometric shapes and invented study metadata.
+A chest CT of an FDA anthropomorphic lung phantom, with 237 slices and artificial nodules. The measurements are examples drawn on the phantom.
 
-![Desktop 2D viewer with a synthetic exam](docs/desktop-2d-synthetic.png)
+![Lung window on the chest phantom with a distance in millimetres and an angle in degrees](docs/chest-ct-measurements.png)
 
-[Desktop 3D viewer](docs/desktop-3d-synthetic.png) · [Mobile 2D viewer](docs/mobile-2d-synthetic.png)
+| Soft-tissue preset | Bone preset with grayscale inversion |
+| --- | --- |
+| [![Soft-tissue window on the same CT slice](docs/chest-ct-soft-tissue.png)](docs/chest-ct-soft-tissue.png) | [![Inverted bone window on the same CT slice](docs/chest-ct-bone-inverted.png)](docs/chest-ct-bone-inverted.png) |
+
+| False-color blend | Multiplanar sections |
+| --- | --- |
+| [![False-color blend at 65% opacity](docs/chest-ct-false-color.png)](docs/chest-ct-false-color.png) | [![Linked axial, coronal and sagittal views](docs/chest-ct-mpr.png)](docs/chest-ct-mpr.png) |
+
+[3D maximum-intensity projection with an adjustable threshold](docs/chest-ct-3d.png) · [Mobile slice viewer](docs/chest-ct-mobile.png)
+
+Image source: B. Zhao, *Lung Phantom* (version 2), The Cancer Imaging Archive, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The screenshots show the original phantom pixels with viewer windowing, color mapping, or annotations applied. The Blend example overlays two display presets of the same acquisition. [Dataset](https://doi.org/10.7937/k9/tcia.2015.08a1ixoo) · [TCIA citation](https://doi.org/10.1007/s10278-013-9622-7)
 
 ## Run with Docker
 
