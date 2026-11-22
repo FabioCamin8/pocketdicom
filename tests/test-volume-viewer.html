@@ -1,0 +1,1312 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket DICOM guided volume test</title>
+<pre id="result" role="status">Running…</pre>
+<div id="viewer"></div>
+<div id="other">Do not remove this host content.</div>
+<script type="module">
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const result = document.querySelector('#result');
+const host = document.querySelector('#viewer');
+const other = document.querySelector('#other');
+const series = {
+  volume: true, modality: 'CT', orientation: [1, 0, 0, 0, 1, 0], spacingZ: 3,
+  frames: Array.from({length: 9}, (_, z) => ({id: z, position: [0, 0, 3 * z]})),
+};
+const framesFor = (depth, base) => Array.from({length: depth}, (_, z) => ({id: base + z, position: [0, 0, z]}));
+const loadFrame = async z => ({width: 12, height: 8, type: 'f32', center: 128, widthWindow: 256,
+  invert: false, spacing: [2, 1], pixels: Float32Array.from({length: 12 * 8}, (_, i) =>
+    (z === 3 && i % 12 < 4 ? 170 : 0) + (z + 1) * 4 + i % 12),
+});
+
+function until(root, predicate, timeout = 4000) {
+  if (predicate()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error(`Viewer did not update: ${String(root.textContent || '').slice(0, 240)}`));
+    }, timeout);
+    const observer = new MutationObserver(() => {
+      if (!predicate()) return;
+      clearTimeout(timer);
+      observer.disconnect();
+      resolve();
+    });
+    observer.observe(root, {attributes: true, childList: true, subtree: true, characterData: true});
+  });
+}
+
+const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+const poll = async (predicate, message, timeout = 15000) => {
+  const end = performance.now() + timeout;
+  while (!predicate()) {
+    if (performance.now() > end) throw new Error(message);
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+};
+const snapshot = canvas => canvas.toDataURL();
+const change = (input, value) => {
+  input.value = value;
+  input.dispatchEvent(new Event('input'));
+  input.dispatchEvent(new Event('change'));
+};
+const rootOf = host => host.lastElementChild.shadowRoot;
+const button = (root, text) => [...root.querySelectorAll('button')].find(node => node.textContent.trim() === text);
+const visible = root => [...root.querySelectorAll('canvas')].filter(node => node.getClientRects().length);
+const pointer = (type, node, x, y, pointerType = 'mouse') => node.dispatchEvent(new PointerEvent(type, {
+  pointerId: 1, pointerType, clientX: x, clientY: y, button: 0, buttons: type === 'pointerup' ? 0 : 1,
+  bubbles: true, cancelable: true, isPrimary: true,
+}));
+
+// Deterministic media override for the desktop/touch branches. Only pointer/hover and
+// the desktop width query are replaced; layout queries keep using the real viewport.
+const realMatchMedia = window.matchMedia.bind(window);
+const mediaList = (query, matchesValue) => ({
+  media: query, matches: matchesValue, onchange: null,
+  addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {},
+  dispatchEvent() { return false; },
+});
+function withMedia(desktop) {
+  const original = window.matchMedia;
+  window.matchMedia = query => {
+    if (/min-width:\s*851px/.test(query)) return mediaList(query, desktop);
+    if (/pointer:\s*fine/.test(query) || /hover:\s*hover/.test(query)) return mediaList(query, desktop);
+    if (/pointer:\s*coarse/.test(query) || /hover:\s*none/.test(query)) return mediaList(query, !desktop);
+    return original.call(window, query);
+  };
+  return () => { window.matchMedia = original; };
+}
+
+// The upgraded build contract is exercised with a deterministic engine so this fixture
+// does not depend on the render/data worker landing first. It still reports progress,
+// loads frames, honours aborts, and returns sourceDimensions on every result.
+function createEngine({
+  sourceWidth, sourceHeight, sourceDepth,
+  quickWidth, quickHeight, quickDepth,
+  native = 'ok', quick = 'ok', holdAfter = 2,
+}) {
+  const calls = [];
+  let release = null;
+  const abortError = () => Object.assign(new Error('Fake build aborted.'), {name: 'AbortError'});
+  const build = async (series, loadFrame, options = {}) => {
+    const kind = options.nativeResolution ? 'native' : options.fullDepth ? 'depth' : 'quick';
+    const call = {kind, options, signal: options.signal};
+    calls.push(call);
+    if (kind === 'native' && native === 'limit') {
+      throw Object.assign(new Error('Native source grid exceeds the 16 MiB build limit.'), {code: 'VOLUME_NATIVE_LIMIT'});
+    }
+    if (kind === 'native' && native === 'fail') throw new Error('Synthetic native failure.');
+    if (kind === 'quick' && quick === 'fail') throw new Error('Synthetic quick failure.');
+    const dimensions = kind === 'native'
+      ? [sourceWidth, sourceHeight, sourceDepth]
+      : kind === 'depth'
+        ? [Math.min(sourceWidth, 192), Math.min(sourceHeight, 192), sourceDepth]
+        : [quickWidth, quickHeight, quickDepth];
+    const depth = dimensions[2];
+    let loads = 0;
+    options.onProgress?.(0, depth);
+    for (let z = 0; z < depth; z += 1) {
+      if (options.signal?.aborted) throw abortError();
+      const sourceZ = Math.min(sourceDepth - 1, Math.floor((z + 0.5) * sourceDepth / depth));
+      await loadFrame(series.frames[sourceZ].id, options.signal);
+      loads += 1;
+      if (kind === 'native' && native === 'hold' && loads > holdAfter) {
+        await new Promise(resolve => { release = resolve; });
+      }
+      if (kind === 'quick' && quick === 'hold' && loads > holdAfter) {
+        await new Promise(resolve => { release = resolve; });
+      }
+      options.onProgress?.(z + 1, depth);
+      if (z % 8 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    if (options.signal?.aborted) throw abortError();
+    const [width, height, slices] = dimensions;
+    const data = new Float32Array(width * height * slices);
+    let min = Infinity, max = -Infinity;
+    for (let z = 0; z < slices; z += 1) {
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const value = (x * 3 + y * 11 + z * 17) % 211;
+          data[x + width * (y + height * z)] = value;
+          if (value < min) min = value;
+          if (value > max) max = value;
+        }
+      }
+    }
+    return {
+      dimensions, data, spacing: [sourceWidth / width, sourceHeight / height, sourceDepth / slices],
+      axes: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+      extentMm: [sourceWidth, sourceHeight, sourceDepth], calibrated: true,
+      center: 128, widthWindow: 256, invert: false,
+      min, max, notes: [], sourceDimensions: [sourceWidth, sourceHeight, sourceDepth],
+    };
+  };
+  return {
+    build, calls,
+    holdReady: () => Boolean(release),
+    release: () => { const resolve = release; release = null; resolve?.(); },
+  };
+}
+
+// Records the requested final raster while remaining cheap enough for the fixture.
+function fastProject(volume, {width, height, pixels, startRow = 0, endRow = height, yaw = 0, zoom = 1} = {}) {
+  const image = pixels ?? new Uint8ClampedArray(width * height * 4);
+  let out = startRow * width * 4;
+  const tint = Math.round(yaw * 41) + Math.round(zoom * 13);
+  for (let py = startRow; py < endRow; py += 1) {
+    for (let px = 0; px < width; px += 1) {
+      const value = (px * 3 + py * 5 + tint) & 255;
+      image[out++] = value;
+      image[out++] = value;
+      image[out++] = value;
+      image[out++] = 255;
+    }
+  }
+  return image;
+}
+
+try {
+  let loadCount = 0;
+  const countedFrame = (...args) => { loadCount++; return loadFrame(...args); };
+  const {mountVolume} = await import('../web/volume.js');
+  const {MAX_PROJECTION_SIZE} = await import('../web/volume-project.js');
+  const cleanup = await mountVolume(host, {series, loadFrame: countedFrame});
+  const root = rootOf(host);
+  await until(root, () => root.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'));
+  await nextPaint();
+
+  const projection = root.querySelector('canvas[aria-label^="3D"]');
+  assert(projection, 'Missing 3D projection canvas.');
+  const mprLabels = [...root.querySelectorAll('canvas[aria-label]')]
+    .map(node => node.getAttribute('aria-label'))
+    .filter(label => /^(Axial|Coronal|Sagittal)/.test(label));
+  assert(mprLabels.length === 3, 'MPR canvases must be labelled Axial, Coronal and Sagittal.');
+
+  const rotate = button(root, 'Rotate volume');
+  const sections = button(root, 'Explore sections');
+  const reset = button(root, 'Reset view');
+  assert(rotate && rotate.getAttribute('aria-pressed') === 'true', 'Rotate volume must start pressed.');
+  assert(sections && reset, 'Missing Explore sections and Reset view buttons.');
+  const details = root.querySelector('details');
+  assert(details && !details.open, 'The 3D details panel must start closed.');
+  details.open = true;
+  const threshold = details.querySelector('input[aria-label="3D threshold"]');
+  const windowControl = details.querySelector('input[aria-label*="window" i]');
+  assert(threshold && windowControl, 'Details must expose threshold and window controls.');
+
+  assert(visible(root).length === 1, 'Only one canvas may be visible initially.');
+  assert(!button(root, 'Load all sections')?.getClientRects().length,
+    'A fully loaded quick volume must not offer the full-section upgrade.');
+  assert(projection.matches('canvas[aria-label^="3D"][data-render-state="ready"]'), 'Completed 3D frame must be marked ready.');
+  assert(root.textContent.includes('Drag to rotate'), 'The completed 3D frame must show the Drag to rotate hint.');
+
+  projection.setPointerCapture = () => {};
+  for (const slice of root.querySelectorAll('.pdv-slice')) slice.setPointerCapture = () => {};
+
+  const original = snapshot(projection);
+  const box = projection.getBoundingClientRect();
+  const cx = box.left + box.width / 2, cy = box.top + box.height / 2;
+  pointer('pointerdown', projection, cx, cy);
+  pointer('pointermove', projection, cx + box.width / 4, cy);
+  pointer('pointerup', projection, cx + box.width / 4, cy);
+  pointer('lostpointercapture', projection, cx + box.width / 4, cy);
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) !== original, 'Dragging the volume must rotate the final frame.');
+  assert(root.textContent.includes('Drag to rotate'), 'The Drag to rotate hint must stay visible after rotation.');
+
+  reset.click();
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) === original, 'Reset view must restore the original projection.');
+
+  const zoom = root.querySelector('input[aria-label*="zoom" i]');
+  assert(zoom, 'Missing zoom control.');
+  change(zoom, '1.5');
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) !== original, 'Zoom must change the final projection pixels.');
+  reset.click();
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) === original, 'Reset view must undo zoom.');
+
+  projection.dispatchEvent(new KeyboardEvent('keydown', {key: '+', bubbles: true}));
+  assert(projection.dataset.renderState !== 'ready', 'Actions must invalidate the frame synchronously.');
+  await until(root, () => projection.dataset.renderState === 'ready');
+  const zoomedIn = snapshot(projection);
+  assert(zoomedIn !== original, 'The + key must change the projection.');
+  projection.dispatchEvent(new KeyboardEvent('keydown', {key: '-', bubbles: true}));
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) !== zoomedIn, 'The - key must change the projection again.');
+  projection.dispatchEvent(new KeyboardEvent('keydown', {key: 'Home', bubbles: true}));
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) === original, 'Home must restore the original projection.');
+
+  const lit = () => {
+    let count = 0;
+    const px = projection.getContext('2d').getImageData(0, 0, projection.width, projection.height).data;
+    for (let i = 0; i < px.length; i += 4) count += Number(px[i] > 0);
+    return count;
+  };
+  const fullSignal = lit();
+  change(threshold, '180');
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(lit() > 0 && lit() < fullSignal, 'Threshold removes sub-threshold signals, not the bright insert.');
+  const thresholdValue = String(threshold.value);
+  const windowValue = String(windowControl.max && Number(windowControl.max) !== Number(windowControl.value)
+    ? windowControl.max : Number(windowControl.value) + Number(windowControl.step || 1));
+  change(windowControl, windowValue);
+  await until(root, () => projection.dataset.renderState === 'ready');
+
+  projection.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowLeft', bubbles: true}));
+  await until(root, () => projection.dataset.renderState === 'ready');
+  const beforeSections = snapshot(projection);
+  assert(beforeSections !== original, 'The projection must differ after rotation, window and threshold changes.');
+  const loadsBeforeSections = loadCount;
+  sections.click();
+  await nextPaint();
+  const narrow = matchMedia('(max-width: 650px)').matches;
+  if (narrow) {
+    assert(visible(root).length === 1, 'Narrow section mode must show one plane.');
+    const planes = ['Axial', 'Coronal', 'Sagittal'].map(name => button(root, name));
+    assert(planes.every(node => node && node.getClientRects().length), 'Narrow mode must show named plane buttons.');
+    assert(visible(root)[0].getAttribute('aria-label').startsWith('Axial'), 'Axial must stay visible before its touch.');
+    const axialSlider = root.querySelector('input[aria-label="Axial slice"]');
+    assert(axialSlider && Number(axialSlider.value) > 0 && Number(axialSlider.value) <= Number(axialSlider.max),
+      'Axial slider must start in range.');
+  } else {
+    assert(visible(root).length === 3, 'Wide section mode must show three planes.');
+  }
+
+  const axialSlice = [...root.querySelectorAll('.pdv-slice')]
+    .find(node => node.querySelector('canvas[aria-label^="Axial"]') || node.getAttribute('aria-label')?.startsWith('Axial'));
+  assert(axialSlice, 'Missing axial image wrapper.');
+  const axialCanvas = axialSlice.querySelector('canvas[aria-label^="Axial"]')
+    || visible(root).find(node => node.getAttribute('aria-label')?.startsWith('Axial'));
+  assert(axialCanvas, 'Missing axial canvas.');
+  const axialRect = axialCanvas.getBoundingClientRect();
+  assert(Math.abs(axialRect.width / axialRect.height - 12 / 16) < 0.02, 'Axial must keep its 12/16 physical aspect.');
+  assert(/L/.test(axialSlice.textContent) && /R/.test(axialSlice.textContent), 'Axial must label its L and R orientation.');
+  axialSlice.setPointerCapture = () => {};
+  const sliceBox = axialSlice.getBoundingClientRect();
+  const tx = sliceBox.left + sliceBox.width * 0.8, ty = sliceBox.top + sliceBox.height * 0.2;
+  const linked = ['Coronal', 'Sagittal'].map(name => root.querySelector(`input[aria-label="${name} slice"]`));
+  assert(linked.every(node => node && Number(node.value) > 0 && Number(node.value) <= Number(node.max)),
+    'Touching a plane must set valid linked plane positions.');
+  const beforeLinked = linked.map(node => node.value);
+  pointer('pointerdown', axialSlice, tx, ty, 'touch');
+  pointer('pointerup', axialSlice, tx, ty, 'touch');
+  pointer('lostpointercapture', axialSlice, tx, ty, 'touch');
+  await nextPaint();
+  assert(linked.every((node, index) => node.value !== beforeLinked[index]),
+    'Touching a plane must move both linked plane positions.');
+  const linkedValues = linked.map(node => node.value).join('|');
+  const axialSnapshot = snapshot(axialCanvas);
+  const coronal = button(root, 'Coronal');
+  if (narrow) {
+    assert(coronal, 'Missing Coronal plane button.');
+    coronal.click();
+    await nextPaint();
+    const coronalCanvas = visible(root)[0];
+    assert(coronalCanvas && coronalCanvas.getAttribute('aria-label').startsWith('Coronal'),
+      'Selecting Coronal must show the Coronal canvas.');
+    assert(linked.map(node => node.value).join('|') === linkedValues, 'Selecting another plane must preserve the touched point.');
+    const axialButton = button(root, 'Axial');
+    assert(axialButton, 'Missing Axial plane button.');
+    axialButton.click();
+    await nextPaint();
+    const axialAgain = visible(root)[0];
+    assert(axialAgain && axialAgain.getAttribute('aria-label').startsWith('Axial'),
+      'Selecting Axial must show the Axial canvas again.');
+    assert(linked.map(node => node.value).join('|') === linkedValues, 'Crosshair position must stay when returning to Axial.');
+    assert(snapshot(axialAgain) === axialSnapshot, 'The Axial crosshair must stay in place after switching planes.');
+  } else {
+    if (coronal) {
+      coronal.click();
+      await nextPaint();
+    }
+    assert(linked.map(node => node.value).join('|') === linkedValues, 'Selecting another plane must preserve the touched point.');
+  }
+
+  rotate.click();
+  await until(root, () => projection.dataset.renderState === 'ready');
+  assert(snapshot(projection) === beforeSections, 'Returning to 3D must preserve the rotated, windowed and thresholded frame.');
+  assert(loadCount === loadsBeforeSections, 'Switching modes must not decode frames again.');
+  assert(threshold.value === thresholdValue, 'Threshold must survive mode switches.');
+  assert(windowControl.value === windowValue, 'Window must survive mode switches.');
+
+  const secondary = await mountVolume(other, {series, loadFrame});
+  const fallbackRoot = rootOf(other);
+  await until(fallbackRoot, () => fallbackRoot.querySelector('canvas[aria-label^="3D"]'));
+  fallbackRoot.querySelector('canvas[aria-label^="3D"]').dispatchEvent(new Event('contextlost'));
+  assert(fallbackRoot.textContent.includes('The slice views are still available.'), 'Loss of the 3D context must keep MPR available.');
+  await nextPaint();
+  const fallbackSections = button(fallbackRoot, 'Explore sections');
+  assert(fallbackSections && fallbackSections.getAttribute('aria-pressed') === 'true',
+    'Loss of the 3D context must press Explore sections.');
+  const fallbackPlanes = matchMedia('(max-width: 650px)').matches ? 1 : 3;
+  assert(visible(fallbackRoot).length === fallbackPlanes, 'Active MPR sections must survive a lost 3D context.');
+  assert(fallbackRoot.querySelectorAll('.pdv-slice').length >= 1, 'Active MPR sections must survive a lost 3D context.');
+  secondary();
+
+  const aborter = new AbortController();
+  let notifiedAbort = false;
+  await mountVolume(other, {series, signal: aborter.signal, loadFrame: (_id, signal) => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => { notifiedAbort = true; reject(signal.reason); }, {once: true});
+  })});
+  aborter.abort();
+  assert(notifiedAbort && other.children.length === 0, 'Aborting must propagate to the frame load and remove only its panel.');
+  assert(other.textContent.includes('Do not remove'), 'Cleanup must preserve other host content.');
+
+  let unsupportedLoads = 0;
+  const unsupported = await mountVolume(other, {series: {...series, volume: false, volumeReason: 'Irregular stack.'},
+    loadFrame: () => { unsupportedLoads++; }});
+  assert(rootOf(other).textContent.includes('Irregular stack.') && !unsupportedLoads, 'Unsupported stacks must degrade without decoding.');
+  unsupported();
+
+  let cancelSignal;
+  const cancelled = await mountVolume(other, {series, loadFrame: (_id, signal) => {
+    cancelSignal = signal;
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), {once: true}));
+  }});
+  const pending = rootOf(other);
+  const cancelButton = [...pending.querySelectorAll('button')].find(node => /cancel/i.test(node.textContent));
+  assert(cancelButton, 'Pending reads must offer a cancel button.');
+  cancelButton.click();
+  assert(cancelSignal.aborted && pending.textContent.includes('canceled'), 'Cancel button must stop pending reads and explain fallback.');
+  cancelled();
+
+  {
+    const sectionCleanup = await mountVolume(other, {series: {...series, orientation: undefined}, loadFrame});
+    const sectionRoot = rootOf(other);
+    await until(sectionRoot, () => sectionRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'));
+    const explore = [...sectionRoot.querySelectorAll('button')].find(button => button.textContent.trim() === 'Explore sections');
+    assert(explore, 'Incomplete geometry must offer Explore sections.');
+    explore.click();
+    const names = ['Acquisition', 'Stack X–Z', 'Stack Y–Z'];
+    const labelled = name => [...sectionRoot.querySelectorAll('canvas')]
+      .find(canvas => (canvas.getAttribute('aria-label') || '').includes(name));
+    await until(sectionRoot, () => names.every(name => labelled(name)));
+    const sectionCanvases = names.map(labelled);
+    assert(sectionCanvases.every(Boolean) && new Set(sectionCanvases).size === 3, 'Explored sections must label three distinct canvases.');
+    if (matchMedia('(max-width: 650px)').matches) names.forEach(name => assert([...sectionRoot.querySelectorAll('button')]
+      .some(button => button.textContent.trim() === name && button.getClientRects().length), `Narrow layout needs a ${name} button.`));
+    sectionCleanup();
+  }
+  {
+    const oldAbort = new AbortController();
+    const oldIds = [], newIds = [];
+    let releaseOld;
+    const oldSeries = {...series, id: 'legacy-phantom', frames: series.frames.map((frame, index) => ({...frame, id: 200 + index}))};
+    const newSeries = {...series, id: 'bright-phantom', frames: series.frames.map((frame, index) => ({...frame, id: 100 + index}))};
+    await mountVolume(other, {series: oldSeries, signal: oldAbort.signal, loadFrame: id => {
+      oldIds.push(id);
+      return new Promise(resolve => {
+        releaseOld = () => resolve({width: 12, height: 8, type: 'f32', center: 128, widthWindow: 256,
+          invert: false, spacing: [2, 1], pixels: new Float32Array(96)});
+      });
+    }});
+    assert(oldIds.length && releaseOld, 'The delayed old phantom must start loading.');
+    oldAbort.abort();
+    const replaceCleanup = await mountVolume(other, {series: newSeries, loadFrame: id => {
+      newIds.push(id);
+      return loadFrame(id).then(frame => ({...frame, pixels: new Float32Array(frame.pixels.length).fill(255)}));
+    }});
+    const replaceRoot = rootOf(other);
+    await until(replaceRoot, () => replaceRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'));
+    await nextPaint();
+    const projection = replaceRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]');
+    const peak = canvas => {
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let max = 0;
+      for (let index = 0; index < data.length; index += 4) max = Math.max(max, data[index]);
+      return max;
+    };
+    assert(!newIds.some(id => oldIds.includes(id)), 'Replacement loads must use distinct frame IDs.');
+    assert(peak(projection) > 100, 'The new bright phantom must reach the canvas.');
+    const bright = snapshot(projection);
+    releaseOld();
+    await nextPaint();
+    await nextPaint();
+    assert(oldAbort.signal.aborted, 'The replaced mount must stay aborted.');
+    assert(other.children.length === 1, 'Replacement must leave exactly one mounted panel.');
+    assert(snapshot(projection) === bright && peak(projection) > 100, 'A late old frame must not repaint new pixels.');
+    replaceCleanup();
+    assert(!other.children.length && other.textContent.includes('Do not remove'), 'Replacement cleanup must preserve host content.');
+  }
+
+
+  {
+    const depth = 220;
+    const firstId = 5000;
+    const largeSeries = {
+      id: 'large-phantom', volume: true, modality: 'CT',
+      orientation: [1, 0, 0, 0, 1, 0], spacingZ: 1,
+      frames: Array.from({length: depth}, (_, z) => ({id: firstId + z, position: [0, 0, z]})),
+    };
+    const largeFrame = id => {
+      const z = id - firstId;
+      return {width: 6, height: 4, type: 'f32', center: 128, widthWindow: 256,
+        invert: false, spacing: [1, 1],
+        pixels: Float32Array.from({length: 24}, (_, i) => ((z + 1) * 7 + i) % 200)};
+    };
+    let mode = 'quick';
+    let upgradeLoads = 0;
+    let failAt = Infinity;
+    let holdAfter = Infinity;
+    let held = null;
+    let upgradeSignal;
+    const largeLoad = async (id, signal) => {
+      if (mode !== 'quick') {
+        upgradeLoads += 1;
+        upgradeSignal = signal;
+        if (mode === 'fail' && upgradeLoads >= failAt) throw new Error('Synthetic full-stack failure.');
+        if (mode === 'hold' && upgradeLoads > holdAfter) {
+          // Ignore the abort until released so the late result reaches the cancellation guard.
+          await new Promise(resolve => { held = () => { held = null; resolve(); }; });
+        }
+      }
+      return largeFrame(id);
+    };
+
+    // All devices, including a wide fine-pointer desktop, start from the quick
+    // 220-frame preview.
+    const restoreLargeMedia = withMedia(true);
+    const largeCleanup = await mountVolume(other, {series: largeSeries, loadFrame: largeLoad});
+    restoreLargeMedia();
+    const largeRoot = rootOf(other);
+    await until(largeRoot, () => largeRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    const largeProjection = largeRoot.querySelector('canvas[aria-label^="3D"]');
+    const largeNote = largeRoot.querySelector('.pdv-volume-note');
+    const quickStatus = largeNote.textContent;
+    assert(/Loaded \d+ of 220 sections\./.test(quickStatus), `Quick 3D must report loaded and total sections: ${quickStatus}`);
+    const quickNote = largeRoot.querySelector('.pdv-upgrade-note');
+    const loadedQuick = Number(/Loaded (\d+) of 220 sections/.exec(quickNote.textContent)?.[1]);
+    assert(loadedQuick > 0 && loadedQuick < depth, 'The quick buildup of a >150-frame stack must skip sections.');
+    assert(quickNote.textContent.includes('reduce XY detail'), 'The upgrade explanation must mention the XY memory trade-off.');
+    const loadAll = button(largeRoot, 'Load all sections');
+    assert(loadAll && loadAll.getClientRects().length, 'A skipped quick volume must offer Load all sections.');
+
+    const largeDetails = largeRoot.querySelector('details');
+    largeDetails.open = true;
+    const largeThreshold = largeDetails.querySelector('input[aria-label="3D threshold"]');
+    change(largeThreshold, '100');
+    await until(largeRoot, () => largeProjection.dataset.renderState === 'ready', 20000);
+    const baseline = snapshot(largeProjection);
+    const thresholdValue = largeThreshold.value;
+    const linkedValues = ['Axial', 'Coronal', 'Sagittal']
+      .map(name => largeRoot.querySelector(`input[aria-label="${name} slice"]`)?.value).join('|');
+
+    mode = 'hold';
+    holdAfter = upgradeLoads + 20;
+    loadAll.click();
+    const cancelAll = button(largeRoot, 'Cancel loading all sections');
+    const upgradeProgress = largeRoot.querySelector('.pdv-upgrade-progress');
+    assert(loadAll.hidden && cancelAll && cancelAll.getClientRects().length, 'Starting the upgrade must swap in its distinct cancel action.');
+    assert(!upgradeProgress.hidden, 'The upgrade must show true progress.');
+    await poll(() => Boolean(held), 'The full-section read did not pause for cancellation.');
+    assert(upgradeSignal && !upgradeSignal.aborted, 'The upgrade must pass an abort signal to frame loads.');
+    assert(Number(upgradeProgress.max) === depth, `Upgrade progress must use the full ${depth}-section total, not the quick depth.`);
+    assert(Number(upgradeProgress.value) > 0 && Number(upgradeProgress.value) < depth, 'Upgrade progress must advance through the full read.');
+    assert(String(upgradeProgress.value) === heldCount(), 'Progress must track the frames already loaded.');
+
+    function heldCount() {
+      return String(upgradeLoads - 1);
+    }
+
+    const pendingSignal = upgradeSignal;
+    loadAll.click();
+    await nextPaint();
+    assert(upgradeSignal === pendingSignal, 'A second upgrade request must not start concurrently.');
+    largeProjection.dispatchEvent(new KeyboardEvent('keydown', {key: '+', bubbles: true}));
+    await until(largeRoot, () => largeProjection.dataset.renderState === 'ready', 20000);
+    largeProjection.dispatchEvent(new KeyboardEvent('keydown', {key: 'Home', bubbles: true}));
+    await until(largeRoot, () => largeProjection.dataset.renderState === 'ready', 20000);
+    assert(snapshot(largeProjection) === baseline, 'The quick 3D view must stay interactive during the upgrade.');
+
+    cancelAll.click();
+    assert(upgradeSignal.aborted, 'Cancel loading all sections must abort the pending reads.');
+    assert(loadAll.getClientRects().length && !loadAll.hidden, 'Cancel must restore the retry action.');
+    assert(loadAll.disabled, 'Retry must wait until the canceled full read has settled.');
+    assert(cancelAll.hidden && upgradeProgress.hidden, 'Cancel must remove its progress and cancel actions.');
+    assert(quickNote.textContent.includes('canceled') && quickNote.textContent.includes(`${loadedQuick} of 220`),
+      'Cancel must explain that the quick section count is still displayed.');
+    assert(largeThreshold.value === thresholdValue, 'Cancel must preserve display settings.');
+    assert(['Axial', 'Coronal', 'Sagittal']
+      .map(name => largeRoot.querySelector(`input[aria-label="${name} slice"]`)?.value).join('|') === linkedValues,
+      'Cancel must preserve the MPR crosshair point.');
+    assert(snapshot(largeProjection) === baseline, 'Cancel must preserve the quick volume and camera.');
+
+    const release = held;
+    assert(release, 'The held full-stack read must still be pending.');
+    release();
+    await nextPaint();
+    await nextPaint();
+    assert(quickNote.textContent.includes('canceled') && !button(largeRoot, 'Cancel loading all sections').getClientRects().length,
+      'A late full-stack result must be ignored after cancellation.');
+    assert(snapshot(largeProjection) === baseline, 'A late full-stack result must not replace the quick volume.');
+    await poll(() => !loadAll.disabled, 'Retry must become available once the canceled read settles.');
+
+    mode = 'fail';
+    failAt = upgradeLoads + 5;
+    loadAll.click();
+    await until(largeRoot, () => /failed/i.test(quickNote.textContent), 20000);
+    assert(loadAll.getClientRects().length && !loadAll.hidden, 'A failed upgrade must keep retry available.');
+    assert(quickNote.textContent.includes(`${loadedQuick} of 220`), 'A failed upgrade must keep the quick section count.');
+    assert(snapshot(largeProjection) === baseline, 'A failed upgrade must not replace the quick volume.');
+
+    mode = 'full';
+    const successStart = upgradeLoads;
+    loadAll.click();
+    await until(largeRoot, () => !button(largeRoot, 'Load all sections')?.getClientRects().length
+      && largeRoot.querySelector('.pdv-volume-note')?.textContent.includes(`Loaded ${depth} of ${depth} sections.`), 30000);
+    const upgradedProjection = largeRoot.querySelector('canvas[aria-label^="3D"]');
+    await until(largeRoot, () => upgradedProjection?.dataset.renderState === 'ready', 30000);
+    assert(!largeRoot.querySelector('.pdv-upgrade'), 'The quick CTA must be removed after the full-depth upgrade.');
+    assert(Number(largeRoot.querySelector('input[aria-label="Axial slice"]')?.max) === depth,
+      'All sections must be available in the upgraded volume.');
+    assert(upgradeLoads - successStart >= depth, 'The successful retry must load every section.');
+    largeCleanup();
+    assert(!other.children.length && other.textContent.includes('Do not remove'), 'Upgrade cleanup must preserve host content.');
+  }
+
+
+  {
+    // Every device starts from the true quick sampled source. A wide fine-pointer
+    // desktop still gets the preview projection first. Full-size current view loads
+    // the native source once; later full-size actions reuse it, while changes return
+    // to the cached quick grid. Full-size 3D keeps the native source and MPR.
+    const sourceDepth = 12;
+    const nativeSeries = {...series, id: 'native-desktop',
+      frames: Array.from({length: sourceDepth}, (_, z) => ({id: 7000 + z, position: [0, 0, 3 * z]}))};
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth,
+      quickWidth: 192, quickHeight: 8, quickDepth: sourceDepth});
+    const projectCalls = [];
+    const project = (volume, options) => {
+      projectCalls.push({width: options.width, maxSubpixels: options.maxSubpixels,
+        yaw: options.yaw, dimensions: volume.dimensions.slice(), volume,
+        preview: options.width <= 96});
+      return fastProject(volume, options);
+    };
+    let frameLoads = 0;
+    const countedNativeLoad = (...args) => { frameLoads += 1; return loadFrame(...args); };
+    const restoreNativeMedia = withMedia(true);
+    const nativeCleanup = await mountVolume(other, {series: nativeSeries,
+      loadFrame: countedNativeLoad, build: engine.build, project});
+    restoreNativeMedia();
+    const nativeRoot = rootOf(other);
+    const canvasNow = () => nativeRoot.querySelector('canvas[aria-label^="3D"]');
+    const noteNow = () => nativeRoot.querySelector('.pdv-volume-note');
+    const hintNow = () => nativeRoot.querySelector('.pdv-rotate .pdv-hint').textContent;
+    const ready = predicate => until(nativeRoot, predicate, 20000);
+    const nativeKinds = () => engine.calls.filter(call => call.kind === 'native');
+    const quickKinds = () => engine.calls.filter(call => call.kind === 'quick');
+    await until(nativeRoot, () => canvasNow()?.dataset.renderState === 'ready', 20000);
+
+    assert(engine.calls.length === 1 && engine.calls[0].kind === 'quick',
+      'A wide fine-pointer desktop must start from the quick sampled source.');
+    assert(noteNow().dataset.quality === 'sampled'
+      && /Sampled preview source volume 192 × 8 × 12 of 260 × 8 × 12 source voxels/.test(noteNow().textContent),
+      `The initial desktop source must be the quick sample: ${noteNow().textContent}`);
+    assert(button(nativeRoot, 'Load full resolution')?.getClientRects().length,
+      'A quick desktop source must offer the explicit full-resolution action.');
+
+    const nativeRect = canvasNow().getBoundingClientRect();
+    const requestedRaster = Math.round(Math.min(nativeRect.width, nativeRect.height) * (devicePixelRatio || 1));
+    const expectedRaster = Math.round(Math.min(MAX_PROJECTION_SIZE, Math.max(64, requestedRaster)));
+    const defaultRaster = 176;
+    assert(canvasNow().width === defaultRaster && canvasNow().height === defaultRaster,
+      `The default desktop projection must stay on the idle preview raster: ${canvasNow().width}`);
+    assert(canvasNow().dataset.projectionMode === 'preview' && /Projection preview/.test(hintNow()),
+      'The default projection must be labelled as a preview.');
+    assert(hintNow().includes('Source volume') && hintNow().includes(`${defaultRaster} × ${defaultRaster}`),
+      'The UI must report the actual preview raster separately from the source volume.');
+    assert(button(nativeRoot, 'Restore preview').getAttribute('aria-pressed') === 'true'
+      && button(nativeRoot, 'Full-size current view').getAttribute('aria-pressed') === 'false'
+      && button(nativeRoot, 'Full-size 3D').getAttribute('aria-pressed') === 'false',
+      'The default projection must select Restore preview.');
+
+    // Full-size current view upgrades the source once for the current pose.
+    button(nativeRoot, 'Full-size current view').click();
+    await ready(() => noteNow()?.dataset.quality === 'native'
+      && canvasNow()?.dataset.renderState === 'ready' && canvasNow().width === expectedRaster);
+    assert(nativeKinds().length === 1, 'Full-size current view must request the native source exactly once.');
+    assert(/Full resolution source volume 260 × 8 × 12 voxels/.test(noteNow().textContent),
+      'The native source must report the exact source grid.');
+    assert(button(nativeRoot, 'Full-size current view').getAttribute('aria-pressed') === 'true'
+      && button(nativeRoot, 'Restore preview').getAttribute('aria-pressed') === 'false',
+      'Full-size current view must expose its selection.');
+    assert(/Full-size current view/.test(hintNow()) && !/Projection preview/.test(hintNow()),
+      'A full-size current frame must be labelled separately from the preview.');
+    assert(canvasNow().dataset.projectionRaster === `${expectedRaster}×${expectedRaster}`,
+      'The one-shot frame metadata must describe the displayed full raster.');
+    const primedNativeCall = [...projectCalls].reverse()
+      .find(call => call.dimensions[0] === 260 && call.width === expectedRaster);
+    assert(primedNativeCall, 'The first full-size view must render the exact native voxels.');
+    const primedNative = primedNativeCall.volume;
+    const primedNativeBuilds = nativeKinds().length;
+
+    const oneShotFrame = snapshot(canvasNow());
+    const oneShotCanvas = canvasNow();
+    oneShotCanvas.focus();
+    oneShotCanvas.setPointerCapture = () => {};
+    const oneShotBox = oneShotCanvas.getBoundingClientRect();
+    const oneShotX = oneShotBox.left + oneShotBox.width / 2;
+    const oneShotY = oneShotBox.top + oneShotBox.height / 2;
+    pointer('pointerdown', oneShotCanvas, oneShotX, oneShotY);
+    pointer('pointerup', oneShotCanvas, oneShotX, oneShotY);
+    pointer('lostpointercapture', oneShotCanvas, oneShotX, oneShotY);
+    await nextPaint();
+    assert(button(nativeRoot, 'Full-size current view').getAttribute('aria-pressed') === 'true'
+      && canvasNow().width === expectedRaster,
+      'Release and focus alone must not leave Full-size current view.');
+    button(nativeRoot, 'Reset view').click();
+    await nextPaint();
+    assert(button(nativeRoot, 'Full-size current view').getAttribute('aria-pressed') === 'true'
+      && canvasNow().width === expectedRaster,
+      'A no-op Reset view must not leave Full-size current view.');
+    assert(snapshot(canvasNow()) === oneShotFrame, 'A no-op reset must preserve the one-shot frame.');
+
+    // A real camera change inside one continuous drag switches to the cached quick
+    // source without dropping the gesture or resetting the accumulated rotation.
+    const dragCanvas = canvasNow();
+    dragCanvas.setPointerCapture = () => {};
+    const dragBox = dragCanvas.getBoundingClientRect();
+    const dx = dragBox.width / 5, dy = dragBox.height / 6;
+    const dragX = dragBox.left + dragBox.width / 2, dragY = dragBox.top + dragBox.height / 2;
+    const dragStart = projectCalls.length;
+    const startYaw = projectCalls[dragStart - 1].yaw;
+    pointer('pointerdown', dragCanvas, dragX, dragY);
+    let movedX = dragX, movedY = dragY;
+    for (let step = 1; step <= 4; step += 1) {
+      movedX = dragX + step * dx / 4;
+      movedY = dragY + step * dy / 4;
+      pointer('pointermove', dragCanvas, movedX, movedY);
+      await nextPaint();
+    }
+    const animatedDragCalls = projectCalls.slice(dragStart);
+    assert(animatedDragCalls.length && animatedDragCalls.every(call => call.dimensions[0] === 192)
+      && animatedDragCalls.every(call => call.width <= 96),
+      'Each change after the one-shot pose must render from the cached quick source at the interactive raster.');
+    pointer('pointerup', dragCanvas, movedX, movedY);
+    pointer('lostpointercapture', dragCanvas, movedX, movedY);
+    await ready(() => canvasNow()?.dataset.renderState === 'ready'
+      && noteNow()?.dataset.quality === 'sampled');
+    const dragCalls = projectCalls.slice(dragStart);
+    assert(dragCalls.every(call => call.dimensions[0] === 192),
+      'The settled one-shot fallback must keep using the cached quick source.');
+    assert(nativeKinds().length === 1, 'The one-shot fallback must not request native again.');
+    assert(quickKinds().length === 1, 'The one-shot fallback must reuse the cached quick grid.');
+    const expectedYaw = (startYaw + (movedX - dragX) * 0.012) % (2 * Math.PI);
+    const lastYaw = projectCalls[projectCalls.length - 1].yaw;
+    const yawError = Math.atan2(Math.sin(lastYaw - expectedYaw), Math.cos(lastYaw - expectedYaw));
+    assert(Math.abs(yawError) < 1e-9,
+      `The continuous one-shot drag must keep its accumulated pose: ${lastYaw} vs ${expectedYaw}`);
+    assert(button(nativeRoot, 'Restore preview').getAttribute('aria-pressed') === 'true'
+      && canvasNow().width === defaultRaster && /Projection preview/.test(hintNow()),
+      'The next camera change must return Full-size current view to the cached preview.');
+    assert(/Sampled preview source volume 192 × 8 × 12/.test(noteNow().textContent),
+      'The one-shot fallback must report the cached quick source again.');
+
+    // Sticky full keeps the native source and full raster through later controls.
+    const stickyLoads = nativeKinds().length;
+    const stickyBuilds = engine.calls.length;
+    const stickyFrames = frameLoads;
+    const stickyProjects = projectCalls.length;
+    button(nativeRoot, 'Full-size 3D').click();
+    await ready(() => noteNow()?.dataset.quality === 'native'
+      && canvasNow()?.dataset.renderState === 'ready' && canvasNow().width === expectedRaster
+      && button(nativeRoot, 'Full-size 3D').getAttribute('aria-pressed') === 'true');
+    assert(nativeKinds().length === stickyLoads && engine.calls.length === stickyBuilds,
+      'Selecting sticky full-size must reuse the primed native source without another build.');
+    assert(frameLoads === stickyFrames,
+      'Selecting sticky full-size must not read source frames again.');
+    assert(projectCalls.slice(stickyProjects)
+      .some(call => call.dimensions[0] === 260 && call.volume === primedNative),
+      'Selecting sticky full-size must render the exact primed native voxels.');
+
+    const stickyStart = projectCalls.length;
+    change(nativeRoot.querySelector('details input[aria-label="3D threshold"]'), '100');
+    await ready(() => canvasNow()?.dataset.renderState === 'ready');
+    assert(button(nativeRoot, 'Full-size 3D').getAttribute('aria-pressed') === 'true'
+      && canvasNow().width === expectedRaster && noteNow().dataset.quality === 'native',
+      'Full-size 3D must stay selected at full raster after a threshold change.');
+    assert(/Full-size 3D/.test(hintNow()) && !/Projection preview/.test(hintNow()),
+      'The sticky full-size view must be labelled as full-size 3D.');
+    assert(projectCalls.slice(stickyStart).length
+      && projectCalls.slice(stickyStart).every(call => call.width === expectedRaster
+        && call.dimensions[0] === 260 && call.maxSubpixels === 1),
+      'Sticky full-size threshold updates must keep the native source at the display/DPR raster.');
+
+    const stickyCanvas = canvasNow();
+    stickyCanvas.setPointerCapture = () => {};
+    const stickyBox = stickyCanvas.getBoundingClientRect();
+    const sx = stickyBox.left + stickyBox.width / 2, sy = stickyBox.top + stickyBox.height / 2;
+    const stickyDragStart = projectCalls.length;
+    pointer('pointerdown', stickyCanvas, sx, sy);
+    pointer('pointermove', stickyCanvas, sx + stickyBox.width / 5, sy);
+    await ready(() => canvasNow()?.dataset.renderState === 'ready'
+      && projectCalls.slice(stickyDragStart).some(call => call.width === expectedRaster));
+    const stickyHeld = projectCalls.slice(stickyDragStart);
+    assert(stickyHeld.length && stickyHeld.every(call => call.width === expectedRaster
+      && call.dimensions[0] === 260 && call.maxSubpixels === 1),
+      'Sticky full-size drags must keep the native source and full display/DPR raster.');
+    pointer('pointerup', stickyCanvas, sx + stickyBox.width / 5, sy);
+    pointer('lostpointercapture', stickyCanvas, sx + stickyBox.width / 5, sy);
+    await ready(() => canvasNow()?.dataset.renderState === 'ready');
+    assert(canvasNow().width === expectedRaster && noteNow().dataset.quality === 'native',
+      'Sticky full-size must keep the native source after release.');
+
+    // Native MPR is swapped back to the cached quick MPR by Restore preview.
+    button(nativeRoot, 'Explore sections').click();
+    await until(nativeRoot, () => [...nativeRoot.querySelectorAll('canvas')]
+      .some(canvas => canvas.getAttribute('aria-label')?.startsWith('Axial')), 20000);
+    await nextPaint();
+    const axialNow = () => [...nativeRoot.querySelectorAll('canvas')]
+      .find(canvas => canvas.getAttribute('aria-label')?.startsWith('Axial'));
+    assert(axialNow().width === 260, `Native MPR must use the native source grid: ${axialNow().width}`);
+    const crosshairBefore = [...nativeRoot.querySelectorAll('.pdv-crosshair')]
+      .flatMap(node => ['--pdv-x', '--pdv-y'].map(name => parseFloat(node.style.getPropertyValue(name))));
+    const callsBeforeRestore = engine.calls.length;
+    button(nativeRoot, 'Restore preview').click();
+    await until(nativeRoot, () => noteNow()?.dataset.quality === 'sampled'
+      && axialNow()?.width === 192, 20000);
+    await nextPaint();
+    assert(button(nativeRoot, 'Restore preview').getAttribute('aria-pressed') === 'true'
+      && button(nativeRoot, 'Full-size 3D').getAttribute('aria-pressed') === 'false',
+      'Restore preview must win over sticky full-size.');
+    assert(button(nativeRoot, 'Explore sections').getAttribute('aria-pressed') === 'true',
+      'Restoring the quick grid must preserve section mode.');
+    assert(engine.calls.length === callsBeforeRestore && quickKinds().length === 1,
+      'Restore preview must reuse the cached quick grid and MPR without fetching.');
+    const crosshairAfter = [...nativeRoot.querySelectorAll('.pdv-crosshair')]
+      .flatMap(node => ['--pdv-x', '--pdv-y'].map(name => parseFloat(node.style.getPropertyValue(name))));
+    assert(crosshairAfter.length === crosshairBefore.length
+      && crosshairAfter.every((value, index) => Math.abs(value - crosshairBefore[index]) < 0.001),
+      'Restore preview must preserve the MPR crosshair.');
+    assert(/Sampled preview source volume 192 × 8 × 12/.test(noteNow().textContent),
+      'Restored MPR must report the cached quick source.');
+
+    button(nativeRoot, 'Rotate volume').click();
+    await ready(() => canvasNow()?.dataset.renderState === 'ready'
+      && canvasNow().width === defaultRaster);
+    assert(/Projection preview/.test(hintNow()) && noteNow().dataset.quality === 'sampled',
+      'Restore preview must return to the labelled quick preview.');
+
+    // Change the pose on the quick source, then request another one-shot full-size
+    // view. The primed native voxels must render the new yaw without a rebuild or
+    // another frame read.
+    const repeatCanvas = canvasNow();
+    repeatCanvas.setPointerCapture = () => {};
+    const repeatBox = repeatCanvas.getBoundingClientRect();
+    const repeatX = repeatBox.left + repeatBox.width / 2;
+    const repeatY = repeatBox.top + repeatBox.height / 2;
+    const priorYaw = projectCalls[projectCalls.length - 1].yaw;
+    pointer('pointerdown', repeatCanvas, repeatX, repeatY);
+    pointer('pointermove', repeatCanvas, repeatX + repeatBox.width / 6, repeatY);
+    pointer('pointerup', repeatCanvas, repeatX + repeatBox.width / 6, repeatY);
+    pointer('lostpointercapture', repeatCanvas, repeatX + repeatBox.width / 6, repeatY);
+    await ready(() => canvasNow()?.dataset.renderState === 'ready'
+      && noteNow()?.dataset.quality === 'sampled');
+    const repeatedYaw = projectCalls[projectCalls.length - 1].yaw;
+    assert(Math.abs(repeatedYaw - priorYaw) > 1e-3,
+      `The repeated one-shot pose must actually change yaw: ${repeatedYaw} vs ${priorYaw}`);
+    const repeatedBuilds = engine.calls.length;
+    const repeatedFrames = frameLoads;
+    const repeatedStart = projectCalls.length;
+    button(nativeRoot, 'Full-size current view').click();
+    await ready(() => noteNow()?.dataset.quality === 'native'
+      && canvasNow()?.dataset.renderState === 'ready' && canvasNow().width === expectedRaster);
+    const repeatedNativeCall = [...projectCalls.slice(repeatedStart)].reverse()
+      .find(call => call.dimensions[0] === 260 && call.width === expectedRaster);
+    assert(repeatedNativeCall, 'The repeated full-size view must render the native source at the full raster.');
+    assert(repeatedNativeCall.volume === primedNative,
+      'The repeated full-size view must render the exact primed native voxels.');
+    assert(Math.abs(repeatedNativeCall.yaw - repeatedYaw) < 1e-9,
+      `The repeated full-size view must render the changed yaw: ${repeatedNativeCall.yaw} vs ${repeatedYaw}`);
+    assert(nativeKinds().length === primedNativeBuilds && engine.calls.length === repeatedBuilds,
+      'The repeated full-size view must reuse the native source without another build.');
+    assert(frameLoads === repeatedFrames,
+      'The repeated full-size view must not read source frames again.');
+
+    // A threshold change also ends a one-shot full view and returns to the quick source.
+    const thresholdBuilds = engine.calls.length;
+    const thresholdFrames = frameLoads;
+    button(nativeRoot, 'Full-size current view').click();
+    await ready(() => noteNow()?.dataset.quality === 'native'
+      && canvasNow()?.dataset.renderState === 'ready' && canvasNow().width === expectedRaster);
+    assert(nativeKinds().length === primedNativeBuilds && engine.calls.length === thresholdBuilds,
+      'A one-shot view after a threshold change must reuse the native source without another build.');
+    assert(frameLoads === thresholdFrames,
+      'A one-shot view after a threshold change must not read source frames again.');
+    const oneShotThresholdLoads = nativeKinds().length;
+    change(nativeRoot.querySelector('details input[aria-label="3D threshold"]'), '150');
+    await ready(() => noteNow()?.dataset.quality === 'sampled'
+      && canvasNow()?.dataset.renderState === 'ready' && canvasNow().width === defaultRaster);
+    assert(nativeKinds().length === oneShotThresholdLoads,
+      'A one-shot threshold change must not request native again.');
+    assert(quickKinds().length === 1,
+      'A one-shot threshold change must reuse the cached quick grid.');
+    assert(button(nativeRoot, 'Restore preview').getAttribute('aria-pressed') === 'true'
+      && /Projection preview/.test(hintNow()),
+      'A threshold change must return Full-size current view to the cached preview.');
+
+    // The explicit action reuses the primed native source but leaves the projection in preview.
+    const explicitStart = nativeKinds().length;
+    const explicitBuilds = engine.calls.length;
+    const explicitFrames = frameLoads;
+    const explicitProjects = projectCalls.length;
+    button(nativeRoot, 'Load full resolution').click();
+    await ready(() => noteNow()?.dataset.quality === 'native'
+      && canvasNow()?.dataset.renderState === 'ready');
+    assert(nativeKinds().length === explicitStart && engine.calls.length === explicitBuilds,
+      'Load full resolution must reuse the primed native source without another build.');
+    assert(frameLoads === explicitFrames,
+      'Load full resolution must not read source frames again.');
+    assert(projectCalls.slice(explicitProjects)
+      .some(call => call.dimensions[0] === 260 && call.volume === primedNative),
+      'Load full resolution must render the exact primed native voxels.');
+    assert(canvasNow().width === defaultRaster && /Projection preview/.test(hintNow()),
+      'An explicit native load must keep the selected preview projection.');
+    assert(button(nativeRoot, 'Restore preview').getAttribute('aria-pressed') === 'true',
+      'An explicit native load must not select a full-size projection.');
+
+    // Once loaded, sticky full-size reuses that native source without another fetch.
+    const stickyReuse = nativeKinds().length;
+    const stickyReuseBuilds = engine.calls.length;
+    const stickyReuseFrames = frameLoads;
+    button(nativeRoot, 'Full-size 3D').click();
+    await ready(() => canvasNow()?.dataset.renderState === 'ready'
+      && canvasNow().width === expectedRaster
+      && button(nativeRoot, 'Full-size 3D').getAttribute('aria-pressed') === 'true');
+    assert(nativeKinds().length === stickyReuse && engine.calls.length === stickyReuseBuilds,
+      'Full-size 3D must reuse an explicitly loaded native source.');
+    assert(frameLoads === stickyReuseFrames,
+      'Full-size 3D must not read source frames again.');
+
+    const finalRestore = engine.calls.length;
+    button(nativeRoot, 'Restore preview').click();
+    await ready(() => noteNow()?.dataset.quality === 'sampled'
+      && canvasNow()?.dataset.renderState === 'ready' && canvasNow().width === defaultRaster);
+    assert(engine.calls.length === finalRestore && quickKinds().length === 1,
+      'Restore preview must return to the cached quick grid without another build.');
+
+    nativeCleanup();
+    assert(!other.children.length, 'Native desktop cleanup must remove its panel.');
+  }
+
+  {
+    // An upgraded mobile volume is native/full too, but the projection still defaults
+    // to preview until Full-size 3D is explicitly chosen.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12});
+    const upgradeCalls = [];
+    const project = (volume, options) => {
+      upgradeCalls.push({width: options.width, maxSubpixels: options.maxSubpixels});
+      return fastProject(volume, options);
+    };
+    const restoreMedia = withMedia(false);
+    const mobileCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7600)},
+      loadFrame, build: engine.build, project});
+    restoreMedia();
+    const mobileRoot = rootOf(other);
+    await until(mobileRoot, () => mobileRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    assert(engine.calls[0].kind === 'quick', 'Touch must start from the sampled quick build.');
+    button(mobileRoot, 'Load full resolution').click();
+    await until(mobileRoot, () => mobileRoot.querySelector('.pdv-volume-note')?.dataset.quality === 'native'
+      && mobileRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 30000);
+    const mobileCanvas = mobileRoot.querySelector('canvas[aria-label^="3D"]');
+    const mobileBox = mobileCanvas.getBoundingClientRect();
+    const mobileRequested = Math.round(Math.min(mobileBox.width, mobileBox.height) * (devicePixelRatio || 1));
+    const mobileRaster = Math.round(Math.min(MAX_PROJECTION_SIZE, Math.max(64, mobileRequested)));
+    assert(mobileCanvas.width === 176 && /Projection preview/i.test(mobileRoot.querySelector('.pdv-rotate .pdv-hint').textContent),
+      'A legacy native source upgrade must leave the projection on its preview.');
+    const mobileSticky = button(mobileRoot, 'Full-size 3D');
+    assert(mobileSticky && button(mobileRoot, 'Full-size current view'), 'Mobile must expose both full-size actions.');
+    mobileSticky.click();
+    await until(mobileRoot, () => mobileCanvas.dataset.renderState === 'ready'
+      && mobileCanvas.width === mobileRaster && mobileSticky.getAttribute('aria-pressed') === 'true', 20000);
+    mobileCanvas.setPointerCapture = () => {};
+    const mobileStart = upgradeCalls.length;
+    const mx = mobileBox.left + mobileBox.width / 2, my = mobileBox.top + mobileBox.height / 2;
+    pointer('pointerdown', mobileCanvas, mx, my);
+    pointer('pointermove', mobileCanvas, mx + mobileBox.width / 5, my);
+    await until(mobileRoot, () => mobileCanvas.dataset.renderState === 'ready'
+      && upgradeCalls.slice(mobileStart).some(call => call.width === mobileRaster), 20000);
+    const mobileHeld = upgradeCalls.slice(mobileStart);
+    assert(mobileHeld.length && mobileHeld.every(call => call.width === mobileRaster),
+      'Upgraded mobile drags must use the full display/DPR raster.');
+    assert(mobileHeld.every(call => call.maxSubpixels === 1),
+      'Upgraded mobile native drags must keep maxSubpixels 1.');
+    assert(mobileCanvas.dataset.projectionRaster === `${mobileRaster}×${mobileRaster}`,
+      'Upgraded mobile metadata must describe the displayed full raster.');
+    assert(!/preview/i.test(mobileRoot.querySelector('.pdv-rotate .pdv-hint').textContent),
+      'Upgraded mobile must never label a native gesture as a preview.');
+    pointer('pointerup', mobileCanvas, mx + mobileBox.width / 5, my);
+    pointer('lostpointercapture', mobileCanvas, mx + mobileBox.width / 5, my);
+    await until(mobileRoot, () => mobileCanvas.dataset.renderState === 'ready');
+    assert(mobileCanvas.width === mobileRaster,
+      'Upgraded mobile must keep the full raster after release.');
+    mobileCleanup();
+  }
+
+  {
+    // Mobile full-size actions reuse the native source upgrade. Restore must cancel a
+    // pending upgrade, ignore its late completion, and still allow a later retry.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12, native: 'hold', holdAfter: 2});
+    const restoreMedia = withMedia(false);
+    const raceCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7700)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const raceRoot = rootOf(other);
+    await until(raceRoot, () => raceRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    const raceCanvas = () => raceRoot.querySelector('canvas[aria-label^="3D"]');
+    const raceSticky = () => button(raceRoot, 'Full-size 3D');
+    const raceCurrent = () => button(raceRoot, 'Full-size current view');
+    const raceRestore = () => button(raceRoot, 'Restore preview');
+    assert(raceSticky() && raceCurrent() && raceRestore() && raceCanvas().width === 176,
+      'Mobile must start on the selected preview raster with both full-size actions available.');
+
+    raceSticky().click();
+    await poll(() => engine.holdReady(), 'The mobile full-size action did not start the native upgrade.');
+    const separateCalls = () => engine.calls.filter(call => call.kind === 'native');
+    const firstNative = separateCalls()[0];
+    assert(firstNative && !firstNative.signal.aborted && raceSticky().getAttribute('aria-pressed') === 'true',
+      'Full-size 3D must select itself and request the native source.');
+    raceCurrent().click();
+    await nextPaint();
+    assert(raceCurrent().getAttribute('aria-pressed') === 'true', 'Switching to the one-shot action must update selection.');
+    raceSticky().click();
+    await nextPaint();
+    assert(raceSticky().getAttribute('aria-pressed') === 'true', 'Switching back to sticky must update selection.');
+    raceRestore().click();
+    assert(firstNative.signal.aborted, 'Restore preview must cancel the pending native upgrade.');
+    assert(raceRestore().getAttribute('aria-pressed') === 'true' && raceSticky().getAttribute('aria-pressed') === 'false',
+      'Restore preview must win over the pending full-size intent.');
+    await until(raceRoot, () => raceCanvas().dataset.renderState === 'ready' && raceCanvas().width === 176, 20000);
+
+    engine.release();
+    await poll(() => !button(raceRoot, 'Load full resolution')?.disabled,
+      'The cancelled native upgrade did not settle for reuse.');
+    assert(raceRestore().getAttribute('aria-pressed') === 'true' && raceCanvas().width === 176,
+      'A late native completion must not flip Restore preview back to a full-size mode.');
+    assert(separateCalls().length === 1, 'Restoring preview must not start another native fetch.');
+
+    raceSticky().click();
+    await poll(() => separateCalls().length === 2,
+      'A later full-size action must be able to reuse the source upgrade.');
+    assert(raceSticky().getAttribute('aria-pressed') === 'true',
+      'A later full-size choice must select sticky mode while its native source loads.');
+    raceCleanup();
+    assert(!other.children.length, 'Mobile projection race cleanup must remove its panel.');
+  }
+
+  {
+    // A small source already within the quick sampling limits is exact from the
+    // first quick build, so full-size actions reuse it without another fetch.
+    const engine = createEngine({sourceWidth: 12, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 12, quickHeight: 8, quickDepth: 12});
+    const restoreMedia = withMedia(true);
+    const exactCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7050)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const exactRoot = rootOf(other);
+    await until(exactRoot, () => exactRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    assert(engine.calls.length === 1 && engine.calls[0].kind === 'quick',
+      'A small source must use exactly one quick build.');
+    const exactNote = exactRoot.querySelector('.pdv-volume-note');
+    assert(exactNote.dataset.quality === 'native'
+      && /Full resolution source volume 12 × 8 × 12 voxels/.test(exactNote.textContent),
+      'A quick build matching the source grid must report full resolution.');
+    assert(!exactRoot.querySelector('.pdv-upgrade'),
+      'An exact quick grid must not offer a redundant source upgrade.');
+    const exactCanvas = exactRoot.querySelector('canvas[aria-label^="3D"]');
+    const exactRect = exactCanvas.getBoundingClientRect();
+    const exactRaster = Math.round(Math.min(MAX_PROJECTION_SIZE, Math.max(64,
+      Math.round(Math.min(exactRect.width, exactRect.height) * (devicePixelRatio || 1)))));
+    button(exactRoot, 'Full-size current view').click();
+    await until(exactRoot, () => exactCanvas.dataset.renderState === 'ready'
+      && exactCanvas.width === exactRaster
+      && button(exactRoot, 'Full-size current view').getAttribute('aria-pressed') === 'true', 20000);
+    assert(engine.calls.length === 1, 'Full-size current view must reuse an exact quick grid.');
+    button(exactRoot, 'Full-size 3D').click();
+    await until(exactRoot, () => exactCanvas.dataset.renderState === 'ready'
+      && button(exactRoot, 'Full-size 3D').getAttribute('aria-pressed') === 'true', 20000);
+    assert(engine.calls.length === 1, 'Full-size 3D must reuse an exact quick grid.');
+    exactCleanup();
+  }
+
+  {
+    // A native limit is discovered only when a full-size action or explicit load
+    // requests the source grid. The cached quick grid and preview stay in place.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12, native: 'limit'});
+    const restoreMedia = withMedia(true);
+    const limitCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7100)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const limitRoot = rootOf(other);
+    await until(limitRoot, () => limitRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    assert(engine.calls.length === 1 && engine.calls[0].kind === 'quick',
+      'A desktop must start from the quick grid before a native limit is requested.');
+    const quickNote = limitRoot.querySelector('.pdv-volume-note');
+    assert(quickNote.dataset.quality === 'sampled' && /192 × 8 × 12/.test(quickNote.textContent),
+      'The limited desktop must keep the quick sampled grid.');
+    const limitCanvas = limitRoot.querySelector('canvas[aria-label^="3D"]');
+    const quickFrame = snapshot(limitCanvas);
+    button(limitRoot, 'Full-size current view').click();
+    await until(limitRoot, () => /memory limit/i.test(limitRoot.querySelector('.pdv-upgrade-note')?.textContent || ''), 10000);
+    await nextPaint();
+    assert(engine.calls.map(call => call.kind).join(',') === 'quick,native',
+      'A limited native request must not rebuild the cached quick grid.');
+    assert(limitRoot.querySelector('.pdv-volume-note').dataset.quality === 'sampled'
+      && /memory limit/i.test(limitRoot.querySelector('.pdv-upgrade-note').textContent),
+      'The automatic fallback must be labelled as sampled and explain the limit.');
+    assert(button(limitRoot, 'Restore preview').getAttribute('aria-pressed') === 'true'
+      && button(limitRoot, 'Full-size current view').getAttribute('aria-pressed') === 'false',
+      'A native limit must return Full-size current view to the cached preview.');
+    assert(snapshot(limitRoot.querySelector('canvas[aria-label^="3D"]')) === quickFrame,
+      'A native limit must preserve the cached quick projection.');
+    assert(button(limitRoot, 'Load full resolution')?.getClientRects().length,
+      'A limited desktop grid must still offer full resolution manually.');
+    limitCleanup();
+  }
+
+  {
+    // Any other native failure is an error, not an automatic quick fallback.
+    // It is reached through an explicit source request and keeps the quick grid.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12, native: 'fail'});
+    const restoreMedia = withMedia(true);
+    const failCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7200)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const failRoot = rootOf(other);
+    await until(failRoot, () => failRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    assert(engine.calls.length === 1 && engine.calls[0].kind === 'quick',
+      'A non-limit native failure must start from the quick grid.');
+    const failCanvas = failRoot.querySelector('canvas[aria-label^="3D"]');
+    const quickFrame = snapshot(failCanvas);
+    button(failRoot, 'Load full resolution').click();
+    await until(failRoot, () => /full resolution failed/i.test(failRoot.querySelector('.pdv-upgrade-note').textContent), 10000);
+    assert(engine.calls.map(call => call.kind).join(',') === 'quick,native',
+      'A non-limit native failure must not rebuild the quick fallback.');
+    assert(failRoot.querySelector('.pdv-volume-note').dataset.quality === 'sampled',
+      'A non-limit native failure must keep the quick source.');
+    assert(button(failRoot, 'Load full resolution')?.getClientRects().length,
+      'A failed native request must keep its retry action.');
+    assert(snapshot(failCanvas) === quickFrame, 'A failed native request must keep the quick projection.');
+    failCleanup();
+  }
+
+
+  {
+    // Touch/narrow starts sampled, then Load all sections keeps every Z section while
+    // retaining reduced XY detail. The single upgrade pipeline stays reachable from MPR,
+    // and full resolution runs afterwards.
+    const sourceDepth = 220;
+    const allSeries = {...series, id: 'touch-all-depth',
+      frames: Array.from({length: sourceDepth}, (_, z) => ({id: 8000 + z, position: [0, 0, z]}))};
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth,
+      quickWidth: 192, quickHeight: 8, quickDepth: 192});
+    const restoreMedia = withMedia(false);
+    const allCleanup = await mountVolume(other, {series: allSeries, loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const allRoot = rootOf(other);
+    await until(allRoot, () => allRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 30000);
+    assert(engine.calls[0].kind === 'quick', 'Touch/narrow must start with the sampled quick build.');
+    assert(allRoot.querySelector('.pdv-volume-note').dataset.quality === 'sampled',
+      'The touch/narrow start must be labelled sampled.');
+    assert(button(allRoot, 'Load all sections')?.getClientRects().length,
+      'A skipped-Z quick preview must offer Load all sections.');
+    assert(button(allRoot, 'Load full resolution')?.getClientRects().length,
+      'A reduced-XY quick preview must offer Load full resolution.');
+
+    const details = allRoot.querySelector('details');
+    details.open = true;
+    const threshold = details.querySelector('input[aria-label="3D threshold"]');
+    change(threshold, '100');
+    const thresholdValue = threshold.value;
+    assert(engine.calls.length === 1,
+      'Threshold changes and mode switches must not request native resolution.');
+    button(allRoot, 'Explore sections').click();
+    await nextPaint();
+    const axial = allRoot.querySelector('input[aria-label="Axial slice"]');
+    const position = () => [...allRoot.querySelectorAll('.pdv-crosshair')]
+      .flatMap(node => ['--pdv-x', '--pdv-y'].map(name => parseFloat(node.style.getPropertyValue(name))));
+    const currentThreshold = () => allRoot.querySelector('input[aria-label="3D threshold"]').value;
+    change(axial, '50');
+    await nextPaint();
+    const crosshair = position();
+    const checkCrosshair = () => {
+      const restored = position();
+      assert(restored.length === 6 && restored.every((value, i) => Math.abs(value - crosshair[i]) < 0.001),
+        'Quality upgrades must preserve the physical MPR crosshair.');
+    };
+
+    button(allRoot, 'Load all sections').click();
+    await until(allRoot, () => /Loaded 220 of 220 sections\./.test(allRoot.querySelector('.pdv-volume-note').textContent), 30000);
+    await nextPaint();
+    assert(allRoot.querySelector('.pdv-volume-note').dataset.quality === 'sampled',
+      'All-depth with reduced XY detail must remain labelled sampled.');
+    assert(!button(allRoot, 'Load all sections')?.getClientRects().length,
+      'Load all sections must disappear once every section is loaded.');
+    assert(button(allRoot, 'Load full resolution')?.getClientRects().length,
+      'Full resolution must remain available after Load all sections.');
+    assert(button(allRoot, 'Explore sections').getAttribute('aria-pressed') === 'true',
+      'Quality upgrades from MPR must preserve section mode.');
+    assert(currentThreshold() === thresholdValue, 'All-depth upgrade must preserve window/threshold settings.');
+    checkCrosshair();
+
+    // Restore preview must swap the all-section volume back to the cached quick grid
+    // and rebuild MPR from it immediately, without another source fetch.
+    const depthCalls = engine.calls.length;
+    button(allRoot, 'Restore preview').click();
+    await until(allRoot, () => {
+      const note = allRoot.querySelector('.pdv-volume-note');
+      return note?.dataset.quality === 'sampled'
+        && /Loaded 192 of 220 sections\./.test(note.textContent)
+        && /192 × 8 × 192/.test(note.textContent);
+    }, 20000);
+    await nextPaint();
+    assert(engine.calls.length === depthCalls,
+      'Restore preview must reuse the cached quick grid after an all-section upgrade.');
+    assert(button(allRoot, 'Explore sections').getAttribute('aria-pressed') === 'true',
+      'Restoring the quick grid after Load all sections must preserve section mode.');
+    assert(currentThreshold() === thresholdValue,
+      'Restoring the quick grid after Load all sections must preserve threshold.');
+    checkCrosshair();
+    assert(button(allRoot, 'Load all sections')?.getClientRects().length,
+      'The restored quick grid must offer its skipped-section upgrade again.');
+    assert(button(allRoot, 'Load full resolution')?.getClientRects().length,
+      'The restored quick grid must still offer full resolution.');
+
+    button(allRoot, 'Load full resolution').click();
+    await until(allRoot, () => allRoot.querySelector('.pdv-volume-note')?.dataset.quality === 'native'
+      && /Full resolution/.test(allRoot.querySelector('.pdv-volume-note').textContent), 30000);
+    await nextPaint();
+    assert(!allRoot.querySelector('.pdv-upgrade'), 'Exact native quality must remove the upgrade actions.');
+    assert(button(allRoot, 'Explore sections').getAttribute('aria-pressed') === 'true',
+      'Native upgrade from MPR must preserve section mode.');
+    assert(currentThreshold() === thresholdValue, 'Native upgrade must preserve threshold.');
+    checkCrosshair();
+    assert(/260 × 8 × 220/.test(allRoot.querySelector('.pdv-volume-note').textContent),
+      'Native full resolution must report the exact source grid.');
+    allCleanup();
+  }
+
+  {
+    // A cancelled native upgrade leaves the current sampled grid and camera untouched,
+    // ignores the late result, and re-enables the retry action.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12, native: 'hold', holdAfter: 2});
+    const restoreMedia = withMedia(false);
+    const cancelNativeCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7300)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const cancelRoot = rootOf(other);
+    await until(cancelRoot, () => cancelRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    const cancelCanvas = cancelRoot.querySelector('canvas[aria-label^="3D"]');
+    const sampledFrame = snapshot(cancelCanvas);
+    button(cancelRoot, 'Load full resolution').click();
+    await poll(() => engine.holdReady(), 'The native upgrade did not pause for cancellation.');
+    const nativeCall = engine.calls.find(call => call.kind === 'native');
+    assert(nativeCall && !nativeCall.signal.aborted, 'The native upgrade must receive an abortable signal.');
+    const cancelNative = button(cancelRoot, 'Cancel loading full resolution');
+    assert(cancelNative && cancelNative.getClientRects().length, 'A native upgrade must offer its own cancel action.');
+    assert(Number(cancelRoot.querySelector('.pdv-upgrade-progress').value) > 0,
+      'Native upgrade progress must advance before cancellation.');
+    cancelNative.click();
+    assert(nativeCall.signal.aborted, 'Cancelling native resolution must abort its frame reads.');
+    assert(button(cancelRoot, 'Load full resolution')?.disabled,
+      'Native retry must wait for the cancelled build to settle.');
+    assert(/canceled/i.test(cancelRoot.querySelector('.pdv-upgrade-note').textContent),
+      'Cancelling native resolution must explain the retained sampled grid.');
+    assert(snapshot(cancelCanvas) === sampledFrame, 'Cancelling native resolution must preserve the current grid.');
+    engine.release();
+    await nextPaint();
+    await nextPaint();
+    await poll(() => !button(cancelRoot, 'Load full resolution').disabled,
+      'Native retry must become available after the late build settles.');
+    assert(snapshot(cancelCanvas) === sampledFrame, 'A late native result must not replace the cancelled grid.');
+    cancelNativeCleanup();
+  }
+
+  {
+    // Native upgrade failure keeps the sampled grid and offers retry, just like all-depth.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12, native: 'fail'});
+    const restoreMedia = withMedia(false);
+    const failureCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7400)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const failureRoot = rootOf(other);
+    await until(failureRoot, () => failureRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    const failureCanvas = failureRoot.querySelector('canvas[aria-label^="3D"]');
+    const sampledFrame = snapshot(failureCanvas);
+    button(failureRoot, 'Load full resolution').click();
+    await until(failureRoot, () => /full resolution failed/i.test(failureRoot.querySelector('.pdv-upgrade-note').textContent), 10000);
+    assert(button(failureRoot, 'Load full resolution')?.getClientRects().length,
+      'A failed native upgrade must keep its retry action.');
+    assert(snapshot(failureCanvas) === sampledFrame, 'A failed native upgrade must keep the current grid.');
+    failureCleanup();
+  }
+
+  {
+    // Cancelling a desktop full-size native request keeps the cached quick grid,
+    // returns to preview, and never starts a second quick fetch.
+    const engine = createEngine({sourceWidth: 260, sourceHeight: 8, sourceDepth: 12,
+      quickWidth: 192, quickHeight: 8, quickDepth: 12, native: 'hold', holdAfter: 1});
+    const restoreMedia = withMedia(true);
+    const fullCancelCleanup = await mountVolume(other, {series: {...series, frames: framesFor(12, 7500)},
+      loadFrame, build: engine.build, project: fastProject});
+    restoreMedia();
+    const fullCancelRoot = rootOf(other);
+    await until(fullCancelRoot, () => fullCancelRoot.querySelector('canvas[aria-label^="3D"][data-render-state="ready"]'), 20000);
+    assert(engine.calls.length === 1 && engine.calls[0].kind === 'quick',
+      'A desktop full-size request must start from the quick grid.');
+    const fullCancelCanvas = () => fullCancelRoot.querySelector('canvas[aria-label^="3D"]');
+    const quickFrame = snapshot(fullCancelCanvas());
+    button(fullCancelRoot, 'Full-size current view').click();
+    await poll(() => engine.holdReady(), 'The desktop full-size native request did not pause.');
+    const nativeCall = engine.calls.find(call => call.kind === 'native');
+    assert(nativeCall && !nativeCall.signal.aborted,
+      'The full-size native request must expose a cancellable signal.');
+    const cancelFull = button(fullCancelRoot, 'Cancel loading full resolution');
+    assert(cancelFull && cancelFull.getClientRects().length,
+      'A full-size native request must offer its cancel action.');
+    cancelFull.click();
+    assert(nativeCall.signal.aborted, 'Cancelling the full-size native request must abort its reads.');
+    assert(/canceled/i.test(fullCancelRoot.querySelector('.pdv-upgrade-note').textContent),
+      'Cancelling the full-size request must explain the retained quick grid.');
+    assert(button(fullCancelRoot, 'Restore preview').getAttribute('aria-pressed') === 'true'
+      && button(fullCancelRoot, 'Full-size current view').getAttribute('aria-pressed') === 'false',
+      'Cancelling the full-size request must return to the cached preview.');
+    await until(fullCancelRoot, () => fullCancelCanvas().dataset.renderState === 'ready'
+      && fullCancelCanvas().width === 176, 20000);
+    engine.release();
+    await nextPaint();
+    await nextPaint();
+    await poll(() => !button(fullCancelRoot, 'Load full resolution')?.disabled,
+      'The cancelled full-size request must settle for retry.');
+    assert(engine.calls.map(call => call.kind).join(',') === 'quick,native',
+      'Cancelling the full-size request must not rebuild the quick grid.');
+    assert(snapshot(fullCancelCanvas()) === quickFrame,
+      'A late full-size result must not replace the cached quick projection.');
+    assert(fullCancelRoot.querySelector('.pdv-volume-note').dataset.quality === 'sampled',
+      'Cancelling the full-size request must keep the quick source label.');
+    fullCancelCleanup();
+  }
+
+  const preAborted = await mountVolume(other, {series, signal: aborter.signal, loadFrame: () => { unsupportedLoads++; }});
+  preAborted();
+  preAborted();
+  assert(!other.children.length && !unsupportedLoads, 'An already aborted mount must have no side effects.');
+  window.testVolumeCleanup = cleanup;
+  result.textContent = 'PASS: guided 3D quick source, sections, slice, projection, threshold, abort, cancel, fallback and upgrades.';
+} catch (error) {
+  result.textContent = `FAIL: ${error.message}`;
+  console.error(error);
+}
+</script>
+</html>

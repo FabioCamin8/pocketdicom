@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark"><meta name="theme-color" content="#101a20">
+  <title>Pocket DICOM · Imaging workspace</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/slice.css"><link rel="stylesheet" href="/blend.css">
+</head>
+<body>
+<header class="topbar"><div class="brand"><svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><rect x="1" y="1" width="32" height="32" rx="8" fill="none" stroke="currentColor"/><path fill="none" stroke="currentColor" stroke-width="2" d="m7 15 10-6 10 6-10 6zM7 20l10 6 10-6"/></svg><span>Pocket <b>DICOM</b></span></div><span class="top-note">Imaging workspace</span><div class="topbar-actions"><button type="button" class="quiet" id="open-library" aria-haspopup="dialog" aria-controls="library-dialog" hidden>Library</button><button type="button" class="quiet" id="help">Quick guide</button></div></header>
+<main class="shell" id="shell">
+ <aside class="rail" id="rail">
+  <section class="source-card"><div class="kicker">01 / SOURCE</div><h1>Open scans</h1>
+   <p class="muted">Choose DICOM files or a folder from an imaging disc.</p>
+   <button id="open-files" class="primary">Choose files</button><button id="open-folder">Choose folder</button>
+   <input type="file" multiple hidden id="input-files"><input type="file" webkitdirectory multiple hidden id="input-folder">
+   <p role="status" id="import-status" class="status"></p><button id="cancel-import" hidden>Cancel import</button>
+  </section>
+  <section class="study-card"><div class="kicker">02 / STUDIES</div><h2>Exam browser</h2><div id="study-list"><p class="muted">No scans open yet.</p></div></section>
+ </aside>
+ <section class="workspace" aria-label="Image workspace">
+  <button id="mobile-library" class="quiet" aria-controls="rail" aria-expanded="false">Show exam browser</button>
+  <div id="welcome"><div class="kicker">VIEWING ROOM</div><h2>Your scans,<br>in their original detail.</h2><p>Start with the original 2D slices. Open Explore in 3D when the scan has enough spatial information.</p><div class="chips"><span>2D slices</span><span>Explore in 3D</span><span>Compare</span></div></div>
+  <section hidden id="active" aria-label="Selected scan">
+   <div class="headline"><div><div id="active-summary" class="kicker"></div><h2 id="active-name"></h2></div><button id="exam-info" class="quiet">Exam details</button></div>
+   <div class="modebar" aria-label="View mode"><button data-mode="slice" aria-pressed="true">2D slices</button><button data-mode="volume" aria-pressed="false">Explore in 3D</button><button data-mode="compare" aria-pressed="false">Compare</button><button data-mode="blend" aria-pressed="false">Blend</button></div>
+   <p id="volume-reason" class="mode-reason" role="note" hidden></p>
+   <div id="compare-config" hidden><label>Second series <select id="compare-series"></select></label><label class="check"><input type="checkbox" id="link-slices"> Link slice positions</label><span id="link-note"></span></div>
+   <div id="view-area" aria-label="Viewer"></div>
+  </section>
+ </section>
+</main>
+<dialog id="info-dialog"><header><h2 id="info-title"></h2><button id="close-info">Close</button></header><div id="info-body"></div></dialog>
+<dialog id="library-dialog" aria-labelledby="library-title" aria-describedby="library-note">
+ <header><h2 id="library-title" tabindex="-1">Saved library</h2><button type="button" class="quiet" id="close-library">Close</button></header>
+ <p class="muted" id="library-note">Choose a saved exam to open it in the viewer. Opening an exam replaces the current view; a failed open leaves the viewer unchanged.</p>
+ <div id="library-write" hidden>
+  <p class="library-write-note">Added images are saved on this server, remain after a page reload, and are visible to paired users.</p>
+  <div class="library-write-actions"><button type="button" id="library-add-files">Add files</button><button type="button" id="library-add-folder">Add folder</button></div>
+  <input type="file" multiple hidden id="library-input-files"><input type="file" webkitdirectory multiple hidden id="library-input-folder">
+  <p role="status" id="library-write-status" class="status"></p>
+ </div>
+ <div id="library-state" class="library-state" role="status"></div>
+ <ul id="library-list" class="library-list" aria-label="Saved exams"></ul>
+</dialog>
+<noscript>This viewer needs JavaScript to display DICOM images.</noscript>
+<script type="module" src="/app.js"></script>
+</body></html>

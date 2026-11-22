@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements.txt
+!server.py
+!dicom_catalog.py
+!dicom_overlays.py
+!dicom_pixels.py
+!web/
+!web/**
